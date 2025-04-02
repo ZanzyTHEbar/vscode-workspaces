@@ -21,11 +21,13 @@ interface Workspace {
     nofail?: boolean;
     remote?: boolean; // true if workspace is remote (vscode-remote:// or docker://)
     lastAccessed?: number; // Timestamp when workspace was last accessed
+    editor?: string; // The editor type (vscode, zed, etc.)
 }
 
 interface RecentWorkspace {
     name: string;
     path: string;
+    editor?: string; // The editor type (vscode, zed, etc.)
     softRemove: () => void;
     removeWorkspaceItem: () => void;
 }
@@ -35,6 +37,9 @@ interface EditorPath {
     binary: string;
     workspacePath: string;
     isDefault?: boolean;
+    storageType?: 'directory' | 'sqlite'; // Type of storage (directory or sqlite database)
+    databasePath?: string; // Path to the database file (for sqlite storage)
+    databaseChannel?: string; // Zed channel (stable, preview, etc.)
 }
 
 const FILE_URI_PREFIX = 'file://';
@@ -61,6 +66,7 @@ export class VSCodeWorkspacesCore {
     private _workspaces: Set<Workspace> = new Set();
     private _recentWorkspaces: Set<RecentWorkspace> = new Set();
     private readonly _userConfigDir: string = GLib.build_filenamev([GLib.get_home_dir(), '.config']);
+    private readonly _userLocalDir: string = GLib.build_filenamev([GLib.get_home_dir(), '.local/share']);
     private _foundEditors: EditorPath[] = [];
     private _activeEditor?: EditorPath;
     private readonly _editors: EditorPath[] = [
@@ -85,8 +91,15 @@ export class VSCodeWorkspacesCore {
             binary: 'cursor',
             workspacePath: GLib.build_filenamev([this._userConfigDir, 'Cursor/User/workspaceStorage']),
         },
+        {
+            name: 'zed',
+            binary: 'zed',
+            workspacePath: '',
+            storageType: 'sqlite',
+            databasePath: GLib.build_filenamev([this._userLocalDir, 'zed/state.db']),
+        },
     ];
-    private readonly _iconNames = ['code', 'vscode', 'vscodium', 'codium', 'code-insiders', 'cursor'];
+    private readonly _iconNames = ['code', 'vscode', 'vscodium', 'codium', 'code-insiders', 'cursor', 'zed'];
     private _menuUpdating: boolean = false;
     private _cleanupOrphanedWorkspaces: boolean = false;
     private _nofailList: string[] = [];
@@ -255,17 +268,40 @@ export class VSCodeWorkspacesCore {
         this._foundEditors = [];
 
         for (const editor of this._editors) {
-            const dir = Gio.File.new_for_path(editor.workspacePath);
+            if (editor.storageType === 'sqlite' && editor.databasePath) {
+                // For sqlite-based editors like Zed
+                const dbFile = Gio.File.new_for_path(editor.databasePath);
+                this._log(`Checking for ${editor.name} database: ${editor.databasePath}`);
 
-            this._log(`Checking for ${editor.name} workspace storage directory: ${editor.workspacePath}`);
+                if (!dbFile.query_exists(null)) {
+                    this._log(`No ${editor.name} database found: ${editor.databasePath}`);
 
-            if (!dir.query_exists(null)) {
-                this._log(`No ${editor.name} workspace storage directory found: ${editor.workspacePath}`);
-                continue;
+                    // Check for alternative locations for Zed
+                    if (editor.name === 'zed') {
+                        this._checkZedInstallations([
+                            GLib.build_filenamev([this._userLocalDir, 'zed/state.db']),
+                            GLib.build_filenamev([this._userLocalDir, 'zed-preview/state.db']),
+                            GLib.build_filenamev([this._userLocalDir, 'zed-dev/state.db'])
+                        ]);
+                    }
+                    continue;
+                }
+
+                this._log(`Found ${editor.name} database: ${editor.databasePath}`);
+                this._foundEditors.push(editor);
+            } else {
+                // For directory-based editors like VSCode
+                const dir = Gio.File.new_for_path(editor.workspacePath);
+                this._log(`Checking for ${editor.name} workspace storage directory: ${editor.workspacePath}`);
+
+                if (!dir.query_exists(null)) {
+                    this._log(`No ${editor.name} workspace storage directory found: ${editor.workspacePath}`);
+                    continue;
+                }
+
+                this._log(`Found ${editor.name} workspace storage directory: ${editor.workspacePath}`);
+                this._foundEditors.push(editor);
             }
-
-            this._log(`Found ${editor.name} workspace storage directory: ${editor.workspacePath}`);
-            this._foundEditors.push(editor);
         }
 
         this._log(`Found editors: ${this._foundEditors.map(editor => editor.name)}`);
@@ -279,6 +315,82 @@ export class VSCodeWorkspacesCore {
             return;
         }
         this._refresh();
+    }
+
+    private _checkZedInstallations(zedPaths: string[]) {
+        // Check each possible Zed installation path and add if found
+        for (const path of zedPaths) {
+            const file = Gio.File.new_for_path(path);
+            if (file.query_exists(null)) {
+                this._log(`Found alternative Zed database at ${path}`);
+
+                // Determine the variant of Zed based on the path
+                let channel = 'stable';
+                if (path.includes('preview')) {
+                    channel = 'preview';
+                } else if (path.includes('dev')) {
+                    channel = 'dev';
+                }
+
+                // Create a new editor entry
+                const editor: EditorPath = {
+                    name: channel === 'stable' ? 'zed' : `zed-${channel}`,
+                    binary: channel === 'stable' ? 'zed' : `zed-${channel}`,
+                    workspacePath: '',
+                    storageType: 'sqlite',
+                    databasePath: path,
+                    databaseChannel: channel
+                };
+
+                this._foundEditors.push(editor);
+            }
+        }
+
+        // If no Zed databases were found but the Zed binary exists, add it anyway
+        if (!this._foundEditors.some(e => e.name === 'zed' || e.name.startsWith('zed-'))) {
+            this._log('No Zed databases found, checking for Zed binary');
+
+            // Try to check if Zed is installed by looking for the binary
+            try {
+                const zedBinaries = ['zed', 'zed-preview', 'zed-dev'];
+                for (const binary of zedBinaries) {
+                    // Use the 'which' command to check if the binary exists
+                    const [success, stdout, stderr, exitStatus] = GLib.spawn_command_line_sync(`which ${binary}`);
+
+                    if (success && exitStatus === 0) {
+                        const decoder = new TextDecoder();
+                        const binaryPath = decoder.decode(stdout).trim();
+
+                        if (binaryPath) {
+                            this._log(`Found Zed binary at ${binaryPath}`);
+
+                            // Determine the variant
+                            let channel = 'stable';
+                            if (binary.includes('preview')) {
+                                channel = 'preview';
+                            } else if (binary.includes('dev')) {
+                                channel = 'dev';
+                            }
+
+                            // Add the editor even without a database
+                            // Users can launch Zed but won't see project listings
+                            const editor: EditorPath = {
+                                name: channel === 'stable' ? 'zed' : `zed-${channel}`,
+                                binary: binary,
+                                workspacePath: '',
+                                storageType: 'sqlite',
+                                databasePath: '',
+                                databaseChannel: channel
+                            };
+
+                            this._foundEditors.push(editor);
+                        }
+                    }
+                }
+            } catch (error) {
+                this._log(`Error checking for Zed binary: ${error}`);
+            }
+        }
     }
 
     private _setActiveEditor() {
@@ -705,6 +817,15 @@ export class VSCodeWorkspacesCore {
         // Create a horizontal container for label and buttons
         const container = new St.BoxLayout({ style_class: 'workspace-box', vertical: false });
 
+        // Add a small editor icon for Zed workspaces
+        if (workspace.editor === 'zed') {
+            const editorIcon = new St.Icon({
+                icon_name: 'edit-symbolic', // Using edit icon since Zed is a code editor
+                style_class: 'editor-icon',
+            });
+            container.add_child(editorIcon);
+        }
+
         // Label with expand:true so it takes up available space
         const label = new St.Label({ text: this._get_name(workspace) });
         container.set_x_expand(true);
@@ -733,9 +854,14 @@ export class VSCodeWorkspacesCore {
                 tooltip = null;
             }
 
-            // Create a new tooltip
+            // Create a new tooltip with editor info for Zed workspaces
+            let tooltipText = this._get_full_path(workspace);
+            if (workspace.editor) {
+                tooltipText += ` [${workspace.editor}]`;
+            }
+
             tooltip = new St.Label({
-                text: this._get_full_path(workspace),
+                text: tooltipText,
                 style_class: 'workspace-tooltip'
             });
 
@@ -835,6 +961,26 @@ export class VSCodeWorkspacesCore {
         }
     }
 
+    private _parseZedDatabase(databaseFile: Gio.File): Workspace | null {
+        try {
+            const filePath = databaseFile.get_path();
+
+            if (!filePath || !GLib.file_test(filePath, GLib.FileTest.EXISTS)) {
+                this._log(`No Zed database found at ${filePath}`);
+                return null;
+            }
+
+            // Zed stores paths in a different format, so we need to create a sqlite-based approach
+            // This method is just a placeholder - we'll use _extractZedProjects to do the actual work
+            this._log(`Found Zed database at ${filePath}`);
+
+            return null;
+        } catch (error) {
+            console.error(error as object, 'Failed to parse Zed database');
+            return null;
+        }
+    }
+
     private _maybeUpdateWorkspaceNoFail(workspace: Workspace): void {
         // Determine the workspace name from its URI
         let workspaceName = GLib.path_get_basename(workspace.uri);
@@ -928,6 +1074,7 @@ export class VSCodeWorkspacesCore {
         return {
             name: workspaceName,
             path: workspace.uri,
+            editor: workspace.editor,
             softRemove: () => {
                 this._log(`Moving Workspace to Trash: ${workspaceName}`);
 
@@ -985,6 +1132,34 @@ export class VSCodeWorkspacesCore {
             this._processBatchedWorkspaces(dir, 0);
         } catch (e) {
             console.error(e as object, 'Failed to load recent workspaces');
+        }
+    }
+
+    private _getZedWorkspaces() {
+        try {
+            const zedEditor = this._foundEditors.find(editor => editor.name === 'zed');
+            if (!zedEditor) {
+                this._log('Zed editor not found');
+                return;
+            }
+
+            // Check if database path is specified
+            const databasePath = zedEditor.databasePath;
+            if (!databasePath) {
+                this._log('No database path specified for Zed');
+                return;
+            }
+
+            const databaseFile = Gio.File.new_for_path(databasePath);
+            if (!databaseFile.query_exists(null)) {
+                this._log(`Zed database does not exist: ${databasePath}`);
+                return;
+            }
+
+            this._log(`Found Zed database at ${databasePath}`);
+            this._extractZedProjects(databaseFile);
+        } catch (error) {
+            console.error(error as object, 'Failed to load Zed workspaces');
         }
     }
 
@@ -1246,6 +1421,48 @@ export class VSCodeWorkspacesCore {
         }
     }
 
+    private _launchZed(files: string[]): void {
+        this._log(`Launching Zed with files: ${files.join(', ')}`);
+        try {
+            if (!this._activeEditor?.binary) {
+                throw new Error('No active editor binary specified');
+            }
+
+            // Build command to launch Zed with the files
+            const paths = files.map(file => `"${file}"`).join(' ');
+            const binaryPath = this._activeEditor.binary;
+
+            // Check if this is a custom path (contains slashes) or just a binary name
+            const isCustomPath = binaryPath.includes('/');
+
+            let command: string;
+            if (isCustomPath) {
+                // For custom paths, use the full path directly
+                command = `"${binaryPath}"`;
+                this._log(`Using custom binary path: ${binaryPath}`);
+            } else {
+                // For standard binary names, use as is
+                command = binaryPath;
+                this._log(`Using standard binary name: ${binaryPath}`);
+            }
+
+            // Add file paths
+            if (paths) {
+                command += ` ${paths}`;
+            }
+
+            // Append custom command arguments if provided
+            if (this._customCmdArgs && this._customCmdArgs.trim() !== '') {
+                command += ` ${this._customCmdArgs.trim()}`;
+            }
+
+            this._log(`Command to execute: ${command}`);
+            GLib.spawn_command_line_async(command);
+        } catch (error) {
+            console.error(error as object, `Failed to launch ${this._activeEditor?.name}`);
+        }
+    }
+
     private _openWorkspace(workspacePath: string) {
         this._log(`Opening workspace: ${workspacePath}`);
         // Record user interaction when opening a workspace
@@ -1258,7 +1475,12 @@ export class VSCodeWorkspacesCore {
             this._log(`Updated lastAccessed timestamp for ${workspacePath}`);
         }
 
-        this._launchVSCode([workspacePath]);
+        // Check if this is a Zed workspace
+        if (workspace?.editor === 'zed' || (this._activeEditor?.name === 'zed')) {
+            this._launchZed([workspacePath]);
+        } else {
+            this._launchVSCode([workspacePath]);
+        }
     }
 
     private _clearRecentWorkspaces() {
@@ -1447,7 +1669,6 @@ export class VSCodeWorkspacesCore {
             this._lightweightRefresh();
         }
 
-
         this._createMenu();
     }
 
@@ -1460,7 +1681,15 @@ export class VSCodeWorkspacesCore {
 
         // Keep existing editors, just update workspaces
         this._log(`Performing lightweight refresh for ${this._activeEditor.name}`);
-        this._getRecentWorkspaces();
+
+        // Process based on editor type
+        if (this._activeEditor.storageType === 'sqlite') {
+            // For Zed or other SQLite-based editors
+            this._getZedWorkspaces();
+        } else {
+            // For VSCode and similar directory-based editors
+            this._getRecentWorkspaces();
+        }
     }
 
     private _log(message: any): void {
@@ -1500,5 +1729,395 @@ export class VSCodeWorkspacesCore {
         } catch (error) {
             console.error(error as object, 'Failed to open extension preferences');
         }
+    }
+
+    private _extractZedProjects(databaseFile: Gio.File) {
+        try {
+            const databasePath = databaseFile.get_path();
+            if (!databasePath) {
+                this._log('Invalid database path');
+                return;
+            }
+
+            // Try command-line sqlite3 first
+            try {
+                this._log(`Attempting to use command-line sqlite3 to extract Zed projects`);
+                this._extractZedProjectsWithCommandLine(databasePath);
+            } catch (error) {
+                this._log(`Command-line sqlite3 failed: ${error}, using file-based fallback`);
+
+                // If sqlite3 command fails, use the file-based approach
+                this._extractZedProjectsWithoutSqlite(databasePath);
+            }
+        } catch (error) {
+            console.error(error as object, 'Failed to extract Zed projects');
+        }
+    }
+
+    private _extractZedProjectsWithCommandLine(databasePath: string) {
+        this._log(`Using command-line approach to extract Zed projects from ${databasePath}`);
+
+        // First, check if sqlite3 is installed by running a simple version command
+        try {
+            const [versionSuccess, , , versionExitStatus] = GLib.spawn_command_line_sync(`sqlite3 --version`);
+            if (!versionSuccess || versionExitStatus !== 0) {
+                throw new Error('sqlite3 command not found');
+            }
+            this._log('sqlite3 command is available');
+        } catch (error) {
+            this._log(`sqlite3 command is not available: ${error}`);
+            throw error; // Propagate to trigger fallback
+        }
+
+        // This is a simplified implementation that extracts project paths
+        const command = `sqlite3 "${databasePath}" "SELECT value FROM kvs WHERE key = 'project_panel/projects';"`;
+
+        try {
+            // Use GLib.spawn_command_line_sync to execute the command
+            const [success, stdout, stderr, exitStatus] = GLib.spawn_command_line_sync(command);
+
+            if (!success || exitStatus !== 0) {
+                const stderrDecoder = new TextDecoder();
+                this._log(`Failed to extract Zed projects: ${stderrDecoder.decode(stderr)}`);
+                throw new Error('sqlite3 command failed');
+            }
+
+            const decoder = new TextDecoder();
+            const output = decoder.decode(stdout).trim();
+
+            if (!output) {
+                this._log('No Zed projects found in database via command-line');
+                this._extractZedProjectsAlternative(databasePath);
+                return;
+            }
+
+            this._log(`Found Zed projects data of length: ${output.length}`);
+
+            // Try to parse the JSON data
+            try {
+                const projectsData = JSON.parse(output);
+
+                if (Array.isArray(projectsData)) {
+                    this._log(`Found ${projectsData.length} Zed projects via command-line`);
+
+                    // Process each project
+                    projectsData.forEach(project => {
+                        if (typeof project === 'string') {
+                            // If the project is a direct path string
+                            this._addZedProject(project);
+                        } else if (project && typeof project === 'object') {
+                            // If the project is an object with a path property
+                            const projectPath = project.path || project.worktree;
+                            if (projectPath) {
+                                this._addZedProject(projectPath);
+                            }
+                        }
+                    });
+                } else {
+                    this._log('Zed projects data is not an array');
+                    this._extractZedProjectsAlternative(databasePath);
+                }
+            } catch (parseError) {
+                this._log(`Failed to parse Zed projects JSON: ${parseError}`);
+                // If parsing fails, try alternative parsing approach
+                this._extractZedProjectsAlternative(databasePath);
+            }
+        } catch (spawnError) {
+            this._log(`Error executing SQLite command: ${spawnError}`);
+            throw spawnError; // Propagate error to trigger file-based fallback
+        }
+    }
+
+    private _extractZedProjectsWithoutSqlite(databasePath: string) {
+        this._log('Using file-based fallback to find Zed projects');
+
+        // Check for common Zed project locations
+        const homeDir = GLib.get_home_dir();
+        const commonLocations = [
+            // Common project locations
+            GLib.build_filenamev([homeDir, 'Projects']),
+            GLib.build_filenamev([homeDir, 'Development']),
+            GLib.build_filenamev([homeDir, 'src']),
+            GLib.build_filenamev([homeDir, 'Code']),
+            GLib.build_filenamev([homeDir, 'git']),
+            GLib.build_filenamev([homeDir, 'workspace']),
+            GLib.build_filenamev([homeDir, 'workspaces']),
+            GLib.build_filenamev([homeDir, 'work']),
+            // Check for Git folders which often indicate projects
+            GLib.build_filenamev([homeDir, 'GitHub']),
+            GLib.build_filenamev([homeDir, 'github']),
+            GLib.build_filenamev([homeDir, 'GitLab']),
+            GLib.build_filenamev([homeDir, 'gitlab']),
+            // Try to read recent directories
+            ...this._getRecentDirectories()
+        ];
+
+        // Check each location
+        let foundAnyProjects = false;
+        let projectCount = 0;
+        const maxProjects = 25; // Reasonable limit to avoid performance issues
+
+        commonLocations.forEach(location => {
+            // Stop if we found enough projects
+            if (projectCount >= maxProjects) return;
+
+            try {
+                const dir = Gio.File.new_for_path(location);
+                if (dir.query_exists(null)) {
+                    const foundProjects = this._scanForProjects(dir, 0, maxProjects - projectCount);
+                    foundAnyProjects = foundAnyProjects || foundProjects.found;
+                    projectCount += foundProjects.count;
+
+                    this._log(`Found ${foundProjects.count} projects in ${location}`);
+                }
+            } catch (error) {
+                this._log(`Error scanning ${location}: ${error}`);
+            }
+        });
+
+        if (!foundAnyProjects) {
+            this._log('No projects found in common locations, adding home directory as fallback');
+            // As a last resort, add the home directory
+            this._addZedProject(homeDir);
+        } else {
+            this._log(`Found a total of ${projectCount} potential Zed projects`);
+        }
+    }
+
+    private _scanForProjects(dir: Gio.File, depth: number = 0, maxProjects: number = 25): { found: boolean, count: number } {
+        // Don't go too deep
+        if (depth > 2) return { found: false, count: 0 };
+
+        let foundProjects = false;
+        let projectCount = 0;
+
+        try {
+            const enumerator = dir.enumerate_children('standard::*', Gio.FileQueryInfoFlags.NONE, null);
+            let info: Gio.FileInfo | null;
+
+            // First pass: Look for git repos or common project marker files at this level
+            while (projectCount < maxProjects && (info = enumerator.next_file(null)) !== null) {
+                const child = enumerator.get_child(info);
+                const childPath = child.get_path();
+                if (!childPath) continue;
+
+                const fileType = info.get_file_type();
+                const fileName = info.get_name();
+
+                if (fileType === Gio.FileType.DIRECTORY) {
+                    // Check for git repo
+                    const gitDir = child.get_child('.git');
+                    if (gitDir.query_exists(null)) {
+                        this._log(`Found git project: ${childPath}`);
+                        this._addZedProject(childPath);
+                        foundProjects = true;
+                        projectCount++;
+                    }
+                } else if (this._isProjectMarkerFile(fileName)) {
+                    // Found a file that indicates this is a project directory
+                    const parentPath = dir.get_path();
+                    if (parentPath) {
+                        this._log(`Found project marker file ${fileName} in ${parentPath}`);
+                        this._addZedProject(parentPath);
+                        foundProjects = true;
+                        projectCount++;
+                        break; // No need to scan more in this directory
+                    }
+                }
+            }
+
+            // Reset enumerator for second pass
+            enumerator.close(null);
+            if (projectCount < maxProjects && depth < 2) {
+                const enumerator2 = dir.enumerate_children('standard::*', Gio.FileQueryInfoFlags.NONE, null);
+
+                // Second pass: Recursively check subdirectories only if we didn't find projects at this level
+                while (projectCount < maxProjects && (info = enumerator2.next_file(null)) !== null) {
+                    const child = enumerator2.get_child(info);
+                    const fileType = info.get_file_type();
+
+                    if (fileType === Gio.FileType.DIRECTORY) {
+                        const subResults = this._scanForProjects(child, depth + 1, maxProjects - projectCount);
+                        foundProjects = foundProjects || subResults.found;
+                        projectCount += subResults.count;
+                    }
+                }
+                enumerator2.close(null);
+            }
+        } catch (error) {
+            this._log(`Error scanning directory: ${error}`);
+        }
+
+        return { found: foundProjects, count: projectCount };
+    }
+
+    private _isProjectMarkerFile(fileName: string): boolean {
+        // Common files that indicate a project directory
+        const projectMarkerFiles = [
+            'package.json',
+            'Cargo.toml',
+            'setup.py',
+            'CMakeLists.txt',
+            'Makefile',
+            'project.clj',
+            'build.gradle',
+            'pom.xml',
+            'build.sbt',
+            '.zed-project'  // Zed-specific project marker
+        ];
+
+        return projectMarkerFiles.includes(fileName);
+    }
+
+    private _extractZedProjectsAlternative(databasePath: string) {
+        this._log('Using alternative method to extract Zed projects');
+
+        // This is a fallback approach for extracting project paths
+        // It uses a more direct SQL query to get project paths
+        const command = `sqlite3 "${databasePath}" "SELECT value FROM kvs WHERE key LIKE '%project%' AND value LIKE '%path%';"`;
+
+        try {
+            const [success, stdout, stderr, exitStatus] = GLib.spawn_command_line_sync(command);
+
+            if (!success || exitStatus !== 0) {
+                const stderrDecoder = new TextDecoder();
+                this._log(`Alternative extraction failed: ${stderrDecoder.decode(stderr)}`);
+                return;
+            }
+
+            const decoder = new TextDecoder();
+            const output = decoder.decode(stdout).trim();
+
+            if (!output) {
+                this._log('No project data found using alternative method');
+                return;
+            }
+
+            // Process each line of output
+            const lines = output.split('\n');
+            this._log(`Found ${lines.length} potential project entries`);
+
+            lines.forEach(line => {
+                try {
+                    const data = JSON.parse(line);
+                    this._processZedProjectData(data);
+                } catch (parseError) {
+                    // Skip items that can't be parsed
+                }
+            });
+        } catch (error) {
+            console.error(`Error in alternative extraction: ${error}`);
+        }
+    }
+
+    private _processZedProjectData(data: any) {
+        // Extract paths from various possible structures
+        if (typeof data === 'string' && data.includes('/')) {
+            this._addZedProject(data);
+        } else if (Array.isArray(data)) {
+            data.forEach(item => {
+                if (typeof item === 'string' && item.includes('/')) {
+                    this._addZedProject(item);
+                } else if (item && typeof item === 'object' && (item.path || item.worktree)) {
+                    this._addZedProject(item.path || item.worktree);
+                }
+            });
+        } else if (data && typeof data === 'object') {
+            // Check for direct path property
+            if (data.path) {
+                this._addZedProject(data.path);
+            }
+
+            // Check for worktree property
+            if (data.worktree) {
+                this._addZedProject(data.worktree);
+            }
+
+            // Check for projects array
+            if (Array.isArray(data.projects)) {
+                data.projects.forEach((project: any) => {
+                    if (typeof project === 'string' && project.includes('/')) {
+                        this._addZedProject(project);
+                    } else if (project && typeof project === 'object' && (project.path || project.worktree)) {
+                        this._addZedProject(project.path || project.worktree);
+                    }
+                });
+            }
+        }
+    }
+
+    private _addZedProject(projectPath: string) {
+        if (!projectPath) return;
+
+        this._log(`Processing Zed project: ${projectPath}`);
+
+        // Convert to file:// URI if it's not already
+        let uri = projectPath;
+        if (!uri.startsWith('file://')) {
+            uri = `file://${projectPath}`;
+        }
+
+        // Create a workspace object for the Zed project
+        const workspace: Workspace = {
+            uri,
+            storeDir: null, // Zed projects don't have a storeDir like VSCode
+            editor: 'zed',
+            lastAccessed: Date.now()
+        };
+
+        this._processWorkspace(workspace);
+    }
+
+    private _getRecentDirectories(): string[] {
+        // Try to get recently accessed directories from common locations
+        // without depending on GTK
+        const recentDirs: string[] = [];
+        try {
+            // Try to find .recently-used.xbel file in user's home directory
+            const homeDir = GLib.get_home_dir();
+            const recentlyUsedPath = GLib.build_filenamev([homeDir, '.recently-used.xbel']);
+            const recentlyUsedFile = Gio.File.new_for_path(recentlyUsedPath);
+
+            if (recentlyUsedFile.query_exists(null)) {
+                try {
+                    // Read the XML file content
+                    const [success, content] = recentlyUsedFile.load_contents(null);
+                    if (success) {
+                        const decoder = new TextDecoder();
+                        const xmlContent = decoder.decode(content);
+
+                        // Simple regex-based approach to extract directory URIs
+                        const matches = xmlContent.match(/href="file:\/\/[^"]+"/g);
+                        if (matches) {
+                            matches.forEach(match => {
+                                // Extract the URI and convert to path
+                                const uri = match.replace('href="', '').replace('"', '');
+                                try {
+                                    // Use GLib to safely convert URI to path
+                                    const path = GLib.filename_from_uri(uri)[0];
+
+                                    // Check if it's a directory and not already added
+                                    if (path && !recentDirs.includes(path)) {
+                                        const file = Gio.File.new_for_path(path);
+                                        if (file.query_exists(null) &&
+                                            file.query_file_type(Gio.FileQueryInfoFlags.NONE, null) === Gio.FileType.DIRECTORY) {
+                                            recentDirs.push(path);
+                                        }
+                                    }
+                                } catch (error) {
+                                    // Skip this URI if conversion fails
+                                }
+                            });
+                        }
+                    }
+                } catch (fileError) {
+                    console.error(`Error reading recently used file: ${fileError}`);
+                }
+            }
+        } catch (error) {
+            console.error(`Error getting recent directories: ${error}`);
+        }
+
+        return recentDirs;
     }
 }
