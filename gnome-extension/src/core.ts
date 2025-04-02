@@ -96,7 +96,7 @@ export class VSCodeWorkspacesCore {
             binary: 'zed',
             workspacePath: '',
             storageType: 'sqlite',
-            databasePath: GLib.build_filenamev([this._userLocalDir, 'zed/state.db']),
+            databasePath: GLib.build_filenamev([this._userLocalDir, 'zed/db/0-global/db.sqlite']),
         },
     ];
     private readonly _iconNames = ['code', 'vscode', 'vscodium', 'codium', 'code-insiders', 'cursor', 'zed'];
