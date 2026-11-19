@@ -96,6 +96,26 @@ make && make install
 
 You can run `make help` to see all available commands.
 
+### Dev Container
+
+If you'd rather not install Node and pnpm on your machine, the repository ships a [Dev Container](https://containers.dev/) with the whole build toolchain (Node 20, pnpm 9, `glib-compile-schemas`, `zip`, `make`). You only need Docker and the VS Code [Dev Containers](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-containers) extension.
+
+1. Open the repository in VS Code and run **Dev Containers: Reopen in Container**. Dependencies are installed automatically on first start.
+2. In the container terminal, build the extension package:
+
+    ```bash
+    cd gnome-extension
+    make pack
+    ```
+
+3. On the **host** (not in the container), install the generated zip:
+
+    ```bash
+    gnome-extensions install --force gnome-extension/vscode-workspaces.zip
+    ```
+
+`make install` copies the extension into the current user's GNOME extensions directory, so running it inside the container has no effect on your desktop. Use `make pack` in the container and `gnome-extensions install` on the host instead.
+
 ### Enabling the extension
 
 After installation you need to enable the extension.
