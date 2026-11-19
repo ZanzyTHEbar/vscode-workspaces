@@ -703,7 +703,7 @@ export class VSCodeWorkspacesCore {
         item.actor.add_style_class_name('custom-menu-item');
 
         // Create a horizontal container for label and buttons
-        const container = new St.BoxLayout({ style_class: 'workspace-box', vertical: false });
+        const container = new St.BoxLayout({ style_class: 'workspace-box' });
 
         // Label with expand:true so it takes up available space
         const label = new St.Label({ text: this._get_name(workspace) });
