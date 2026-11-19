@@ -12,7 +12,11 @@ export default class VSCodeWorkspacesExtension extends Extension {
 
     enable() {
         let gsettings: Gio.Settings = this.getSettings();
-        this.core = new VSCodeWorkspacesCore(this.metadata, this.openPreferences, gsettings);
+        this.core = new VSCodeWorkspacesCore(
+            this.metadata,
+            () => this.openPreferences(),
+            gsettings
+        );
         this.core.enable();
     }
 
