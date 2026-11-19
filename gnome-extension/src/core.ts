@@ -613,40 +613,22 @@ export class VSCodeWorkspacesCore {
         (this._indicator.menu as PopupMenu.PopupMenu).addMenuItem(editorSelector);
     }
 
+    /**
+     * Names entries like VS Code's recent list: folders by their own name, workspace
+     * files as "<name> (Workspace)", remote entries with a "[SSH: host]"-style suffix.
+     */
     private _get_name(workspace: RecentWorkspace) {
         const remote = this._parseRemoteUri(workspace.path);
-        if (remote) {
-            const name = GLib.path_get_basename(remote.path).replace(/\.code-workspace$/, '');
-            return `${name} [${remote.label}]`;
-        }
+        const path = remote
+            ? remote.path
+            : decodeURIComponent(workspace.path).replace(FILE_URI_PREFIX, '');
 
-        let nativePath = decodeURIComponent(workspace.path).replace(FILE_URI_PREFIX, '');
-        let name = GLib.path_get_basename(nativePath);
+        const baseName = GLib.path_get_basename(path);
+        const name = baseName.endsWith('.code-workspace')
+            ? `${baseName.replace(/\.code-workspace$/, '')} (Workspace)`
+            : baseName;
 
-        try {
-            const file = Gio.File.new_for_path(nativePath);
-            if (file.query_file_type(Gio.FileQueryInfoFlags.NONE, null) === Gio.FileType.DIRECTORY) {
-                const enumerator = file.enumerate_children('standard::name', Gio.FileQueryInfoFlags.NONE, null);
-                let info: Gio.FileInfo | null;
-                while ((info = enumerator.next_file(null)) !== null) {
-                    const childName = info.get_name();
-                    if (childName.endsWith('.code-workspace')) {
-                        name = childName.replace('.code-workspace', '');
-                        break;
-                    }
-                }
-                enumerator.close(null);
-            } else {
-                if (name.endsWith('.code-workspace')) {
-                    name = name.replace('.code-workspace', '');
-                }
-            }
-        } catch (error) {
-            // In case of error, fallback to the base name.
-            console.error(error as object, 'Error getting workspace name');
-        }
-        name = name.replace(GLib.get_home_dir(), '~');
-        return name;
+        return remote ? `${name} [${remote.label}]` : name;
     }
 
     private _get_full_path(workspace: RecentWorkspace) {
