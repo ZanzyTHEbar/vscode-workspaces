@@ -1,0 +1,15 @@
+{
+    "name": "VSCode Workspaces",
+    "build": {
+        "dockerfile": "Dockerfile"
+    },
+    "remoteUser": "node",
+    "postCreateCommand": "cd gnome-extension && pnpm install --frozen-lockfile",
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "esbenp.prettier-vscode"
+            ]
+        }
+    }
+}
