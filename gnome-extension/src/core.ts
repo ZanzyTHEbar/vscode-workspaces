@@ -1,5 +1,6 @@
 import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
+import Shell from 'gi://Shell';
 import St from 'gi://St';
 import { ExtensionMetadata, gettext } from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
@@ -87,6 +88,16 @@ export class VSCodeWorkspacesCore {
         },
     ];
     private readonly _iconNames = ['code', 'vscode', 'vscodium', 'codium', 'code-insiders', 'cursor'];
+    private readonly _appIds = [
+        'code.desktop',
+        'com.microsoft.VSCode.desktop',
+        'code_code.desktop',
+        'com.visualstudio.code.desktop',
+        'codium.desktop',
+        'com.vscodium.codium.desktop',
+        'code-insiders.desktop',
+        'cursor.desktop',
+    ];
     private _menuUpdating: boolean = false;
     private _cleanupOrphanedWorkspaces: boolean = false;
     private _nofailList: string[] = [];
@@ -193,6 +204,20 @@ export class VSCodeWorkspacesCore {
     }
 
     private _createDefaultIcon(): St.Icon {
+        // Prefer the editor's own app icon from its .desktop file; GNOME Shell
+        // resolves it wherever it lives (icon theme, /usr/share/pixmaps, snap, flatpak).
+        const appSystem = Shell.AppSystem.get_default();
+        for (const appId of this._appIds) {
+            const app = appSystem.lookup_app(appId);
+            if (app) {
+                this._log(`Using app icon from: ${appId}`);
+                return new St.Icon({
+                    gicon: app.get_icon(),
+                    style_class: 'system-status-icon',
+                });
+            }
+        }
+
         let iconName = 'code';
         for (const name of this._iconNames) {
             if (this._iconExists(name)) {
@@ -703,7 +728,7 @@ export class VSCodeWorkspacesCore {
         item.actor.add_style_class_name('custom-menu-item');
 
         // Create a horizontal container for label and buttons
-        const container = new St.BoxLayout({ style_class: 'workspace-box', vertical: false });
+        const container = new St.BoxLayout({ style_class: 'workspace-box' });
 
         // Label with expand:true so it takes up available space
         const label = new St.Label({ text: this._get_name(workspace) });
