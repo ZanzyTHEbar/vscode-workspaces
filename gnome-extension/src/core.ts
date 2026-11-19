@@ -614,6 +614,12 @@ export class VSCodeWorkspacesCore {
     }
 
     private _get_name(workspace: RecentWorkspace) {
+        const remote = this._parseRemoteUri(workspace.path);
+        if (remote) {
+            const name = GLib.path_get_basename(remote.path).replace(/\.code-workspace$/, '');
+            return `${name} [${remote.label}]`;
+        }
+
         let nativePath = decodeURIComponent(workspace.path).replace(FILE_URI_PREFIX, '');
         let name = GLib.path_get_basename(nativePath);
 
@@ -644,6 +650,9 @@ export class VSCodeWorkspacesCore {
     }
 
     private _get_full_path(workspace: RecentWorkspace) {
+        const remote = this._parseRemoteUri(workspace.path);
+        if (remote) return remote.path;
+
         let path = decodeURIComponent(workspace.path);
         path = path.replace(FILE_URI_PREFIX, '').replace(GLib.get_home_dir(), '~');
         return path;
@@ -1053,7 +1062,9 @@ export class VSCodeWorkspacesCore {
 
     private _processWorkspace(workspace: Workspace) {
         const pathToWorkspace = Gio.File.new_for_uri(workspace.uri);
-        if (!pathToWorkspace.query_exists(null)) {
+        // Remote workspaces (SSH, Dev Containers, WSL, ...) can't be checked locally,
+        // so they are never treated as missing or orphaned.
+        if (!workspace.remote && !pathToWorkspace.query_exists(null)) {
             this._log(`Workspace not found: ${pathToWorkspace.get_path()}`);
             if (this._cleanupOrphanedWorkspaces && !workspace.nofail) {
                 this._log(`Workspace will be removed: ${pathToWorkspace.get_path()}`);
@@ -1071,7 +1082,7 @@ export class VSCodeWorkspacesCore {
         }
 
         // Check for .code-workspace files if preferred
-        if (this._preferCodeWorkspaceFile) {
+        if (this._preferCodeWorkspaceFile && !workspace.remote) {
             this._maybePreferWorkspaceFile(workspace);
         }
 
@@ -1081,9 +1092,126 @@ export class VSCodeWorkspacesCore {
             return;
         }
 
-        // Set initial access timestamp
-        workspace.lastAccessed = Date.now();
+        workspace.lastAccessed = this._getLastUsedTime(workspace);
         this._workspaces.add(workspace);
+    }
+
+    /**
+     * VS Code updates a workspace's storage (state.vscdb) whenever the workspace is used,
+     * so its modification time approximates when the workspace was last opened.
+     */
+    private _getLastUsedTime(workspace: Workspace): number {
+        for (const name of ['state.vscdb', 'workspace.json']) {
+            try {
+                const info = workspace.storeDir
+                    ?.get_child(name)
+                    .query_info('time::modified', Gio.FileQueryInfoFlags.NONE, null);
+                const modified = info?.get_modification_date_time();
+                if (modified) return modified.to_unix() * 1000;
+            } catch {
+                // File missing, try the next one
+            }
+        }
+        return 0;
+    }
+
+    /**
+     * Parses a vscode-remote:// URI into a VS Code-style label and the remote path, e.g.
+     *   vscode-remote://ssh-remote%2Bdev-vm/home/me/project
+     *     -> { label: 'SSH: dev-vm', path: '/home/me/project' }
+     *   vscode-remote://dev-container%2B<hex>@ssh-remote%2Bdev-vm/workspaces/app
+     *     -> { label: 'Dev Container: <name> @ dev-vm', path: '/workspaces/app' }
+     */
+    private _parseRemoteUri(uri: string): { label: string; path: string } | null {
+        const match = uri.match(/^vscode-remote:\/\/([^/]*)(\/.*)?$/);
+        if (!match) return null;
+
+        // Nested remotes are joined with '@' (innermost first); split before decoding
+        const hops = match[1].split('@').map(hop => {
+            const decoded = decodeURIComponent(hop);
+            const plus = decoded.indexOf('+');
+            return plus < 0
+                ? { kind: decoded, data: '' }
+                : { kind: decoded.slice(0, plus), data: decoded.slice(plus + 1) };
+        });
+
+        const [inner, ...hosts] = hops;
+        let label = this._describeRemoteHop(inner.kind, inner.data);
+        for (const host of hosts) {
+            label += ` @ ${this._remoteHostName(host.data) || host.kind}`;
+        }
+        return { label, path: decodeURIComponent(match[2] ?? '/') };
+    }
+
+    private _describeRemoteHop(kind: string, data: string): string {
+        switch (kind) {
+            case 'ssh-remote':
+                return `SSH: ${this._remoteHostName(data)}`;
+            case 'dev-container': {
+                const name = this._devContainerName(data);
+                return name ? `Dev Container: ${name}` : 'Dev Container';
+            }
+            case 'attached-container': {
+                const containerName = this._decodeHexJson(data)?.containerName;
+                return containerName ? `Container: ${String(containerName).replace(/^\//, '')}` : 'Container';
+            }
+            case 'wsl':
+                return `WSL: ${data}`;
+            case 'tunnel':
+                return `Tunnel: ${data}`;
+            case 'codespaces':
+                return `Codespaces: ${data}`;
+            default:
+                return data ? `${kind}: ${data}` : kind;
+        }
+    }
+
+    /** SSH hosts are either plain names or hex-encoded JSON like {"hostName":"user@host"} */
+    private _remoteHostName(data: string): string {
+        return this._decodeHexJson(data)?.hostName ?? data;
+    }
+
+    private _devContainerNames = new Map<string, string | null>();
+
+    /**
+     * Dev container authorities carry hex-encoded JSON with the host folder and the
+     * devcontainer.json location. Use the "name" from devcontainer.json when the file is
+     * local, otherwise fall back to the host folder name.
+     */
+    private _devContainerName(data: string): string | null {
+        if (this._devContainerNames.has(data)) return this._devContainerNames.get(data)!;
+
+        const info = this._decodeHexJson(data);
+        let name: string | null = null;
+        if (info?.configFile?.scheme === 'file' && info.configFile.path) {
+            try {
+                const configFile = Gio.File.new_for_path(info.configFile.path);
+                const [, contents] = configFile.load_contents(null);
+                const nameMatch = new TextDecoder().decode(contents).match(/"name"\s*:\s*"([^"]+)"/);
+                if (nameMatch) name = nameMatch[1];
+            } catch {
+                // devcontainer.json moved or unreadable, fall back below
+            }
+        }
+        if (!name && typeof info?.hostPath === 'string') {
+            name = GLib.path_get_basename(info.hostPath);
+        }
+
+        this._devContainerNames.set(data, name);
+        return name;
+    }
+
+    private _decodeHexJson(data: string): any | null {
+        if (!data || data.length % 2 !== 0 || !/^[0-9a-fA-F]+$/.test(data)) return null;
+        try {
+            const bytes = new Uint8Array(data.length / 2);
+            for (let i = 0; i < bytes.length; i++) {
+                bytes[i] = parseInt(data.slice(i * 2, i * 2 + 2), 16);
+            }
+            return JSON.parse(new TextDecoder().decode(bytes));
+        } catch {
+            return null;
+        }
     }
 
     private _maybePreferWorkspaceFile(workspace: Workspace) {
@@ -1187,7 +1315,9 @@ export class VSCodeWorkspacesCore {
             const dirPaths: string[] = [];
 
             files.forEach(file => {
-                if (GLib.file_test(file, GLib.FileTest.IS_DIR)) {
+                // Entries are URIs (file:// or vscode-remote://), which can't be checked with
+                // GLib.file_test. Only .code-workspace files are files; everything else is a folder.
+                if (!file.endsWith('.code-workspace')) {
                     this._log(`Found a directory: ${file}`);
                     dirPaths.push(file);
                 } else {
